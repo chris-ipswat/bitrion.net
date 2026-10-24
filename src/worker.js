@@ -23,9 +23,46 @@ export default {
         return json({ success: false, error: 'Failed to send message. Please try again or email us directly.' }, 502);
       }
     }
+    if (url.pathname === '/api/diag') return diag(env); // TEMPORARY: connectivity check from inside Cloudflare; remove after debugging
     return env.ASSETS.fetch(request);
   },
 };
+
+// TEMPORARY diagnostic: can this Worker reach the mail server, and from which IP?
+async function diag(env) {
+  const host = env.SMTP_HOST || '';
+  const out = { smtp_host: host, checks: {} };
+  const probe = async (label, hostname, port, opts, send) => {
+    const t0 = Date.now();
+    let socket;
+    try {
+      socket = connect({ hostname, port }, opts);
+      const writer = socket.writable.getWriter();
+      const reader = socket.readable.getReader();
+      if (send) await writer.write(new TextEncoder().encode(send));
+      let timer;
+      const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('no answer within 8s')), 8000); });
+      const { value } = await Promise.race([reader.read(), timeout]).finally(() => clearTimeout(timer));
+      const text = new TextDecoder().decode(value || new Uint8Array());
+      try { reader.releaseLock(); writer.releaseLock(); } catch { /* noop */ }
+      out.checks[label] = { ok: true, ms: Date.now() - t0, first_line: text.split('\r\n')[0].slice(0, 120) };
+      const body = text.split('\r\n\r\n')[1] || '';
+      const ip = body.match(/\d+\.\d+\.\d+\.\d+/);
+      if (label === 'egress_ip' && ip) out.worker_outbound_ip = ip[0];
+    } catch (e) {
+      out.checks[label] = { ok: false, ms: Date.now() - t0, error: String((e && e.message) || e) };
+    } finally {
+      try { if (socket) await socket.close(); } catch { /* noop */ }
+    }
+  };
+  await probe('egress_ip', 'checkip.amazonaws.com', 80, { secureTransport: 'off' }, 'GET / HTTP/1.0\r\nHost: checkip.amazonaws.com\r\n\r\n');
+  if (host) {
+    await probe('smtp_465_tls', host, 465, { secureTransport: 'on' });
+    await probe('smtp_587_plain', host, 587, { secureTransport: 'off' });
+    await probe('https_8443', host, 8443, { secureTransport: 'on' }, `GET / HTTP/1.0\r\nHost: ${host}\r\n\r\n`);
+  }
+  return json(out);
+}
 
 const MAX = { name: 100, email: 254, service: 100, message: 5000 };
 
